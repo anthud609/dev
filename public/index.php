@@ -1,22 +1,21 @@
 <?php
 // public/index.php
-
-// 1. Turn on full error reporting (for development)
+// 1. show all errors (dev only)
 error_reporting(E_ALL);
 ini_set('display_errors', '1');
 
-// 2. Autoload and bootstrap the Sentinel logger
+// 2. bootstrap
 require __DIR__ . '/../vendor/autoload.php';
-
 use App\Core\Sentinel;
 
-// Initialize Sentinel (this just sets up the file handler)
+// 3. initialize
 $logger = new Sentinel();
 
-// 3. Send all PHP errors/exceptions through Sentinel
+// 4. send all PHP errors/exceptions through Sentinel
 set_error_handler([$logger, 'handlePhpError']);
 set_exception_handler([$logger, 'handleUncaughtException']);
 register_shutdown_function([$logger, 'handleFatalError']);
+
 
 // 4. Your application code / manual logs
 
