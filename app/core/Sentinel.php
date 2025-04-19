@@ -94,7 +94,7 @@ class Sentinel
 
     public function __construct(
         ?string $logFile       = null,
-        bool    $debugMode     = true,
+        bool    $debugMode     = false,
         string  $defaultModule = 'app'
     ) {
         $this->debugMode     = $debugMode;
