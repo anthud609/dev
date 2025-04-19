@@ -1,29 +1,33 @@
 <?php
-
 namespace App\Core;
 
+use Monolog\Logger;
+use Monolog\Handler\StreamHandler;
+use Monolog\Formatter\LineFormatter;
 use Throwable;
 
 class Sentinel
 {
-    protected string $logFile;
-    private bool $handlingError = false;
+    protected Logger $logger;
     private bool $debugMode;
+    private string $defaultModule;
 
-    public function __construct(string $logFile = null, bool $debugMode = true)  // Debug mode ON by default
+    public function __construct(string $logFile = null, bool $debugMode = true, string $defaultModule = 'app_logger') 
     {
         $this->debugMode = $debugMode;
-        $this->logFile = $logFile ?? __DIR__ . '/../../storage/logs/app.log';  // Fixed path depth
+        $this->defaultModule = $defaultModule;
         
+        $logFile = $logFile ?? __DIR__ . '/../../storage/logs/app.log';
+
         try {
-            $this->initializeLogFile();
-            $this->registerErrorHandlers();
-            
+            $this->initializeLogFile($logFile);
+            $this->initializeMonolog($logFile);
+
             if ($this->debugMode) {
-                $this->log('DEBUG', 'Logger initialized', [
-                    'logFile' => $this->logFile,
-                    'realpath' => realpath($this->logFile) ?: 'NOT FOUND',
-                    'writable' => is_writable($this->logFile) ? 'YES' : 'NO'
+                $this->logger->debug('Logger initialized', [
+                    'logFile' => $logFile,
+                    'realpath' => realpath($logFile) ?: 'NOT FOUND',
+                    'writable' => is_writable($logFile) ? 'YES' : 'NO'
                 ]);
             }
         } catch (\Throwable $e) {
@@ -34,9 +38,9 @@ class Sentinel
         }
     }
 
-    private function initializeLogFile(): void
+    private function initializeLogFile(string $logFile): void
     {
-        $logDir = dirname($this->logFile);
+        $logDir = dirname($logFile);
         
         if (!is_dir($logDir)) {
             if (!mkdir($logDir, 0775, true) && !is_dir($logDir)) {
@@ -47,116 +51,86 @@ class Sentinel
             }
         }
         
-        if (!file_exists($this->logFile)) {
-            if (touch($this->logFile)) {
-                chmod($this->logFile, 0664);
+        if (!file_exists($logFile)) {
+            if (touch($logFile)) {
+                chmod($logFile, 0664);
                 if ($this->debugMode) {
-                    error_log("Created log file: {$this->logFile}");
+                    error_log("Created log file: {$logFile}");
                 }
             } else {
-                throw new \RuntimeException("Cannot create log file: {$this->logFile}");
+                throw new \RuntimeException("Cannot create log file: {$logFile}");
             }
         }
         
-        if (!is_writable($this->logFile)) {
-            throw new \RuntimeException("Log file is not writable: {$this->logFile}");
+        if (!is_writable($logFile)) {
+            throw new \RuntimeException("Log file is not writable: {$logFile}");
         }
     }
 
-    public function log(string $level, string $message, $context = null, string $module = null): bool
+    private function initializeMonolog(string $logFile): void
     {
-        if ($this->handlingError) {
-            if ($this->debugMode) {
-                error_log("Prevented recursive logging during error handling");
-            }
-            return false;
-        }
+        // Create the logger with the default module name
+        $this->logger = new Logger($this->defaultModule);
         
-        $this->handlingError = true;
-        $success = false;
+        // Create a handler for logging to the file
+        $streamHandler = new StreamHandler($logFile, Logger::DEBUG);  // Adjust log level as needed
         
-        try {
-            $timestamp = date('Y-m-d H:i:s');
-            $moduleStr = $module ? "[$module] " : '';
-            
-            $contextStr = '';
-            if ($context !== null) {
-                if (is_scalar($context)) {
-                    $contextStr = (string)$context;
-                } else {
-                    $contextStr = json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-                    if ($contextStr === false) {
-                        $contextStr = '{"json_error":"'.json_last_error_msg().'"}';
-                    }
-                }
-            }
-            
-            $entry = "[$timestamp] $moduleStr[$level] $message $contextStr" . PHP_EOL;
-            
-            $bytesWritten = file_put_contents($this->logFile, $entry, FILE_APPEND | LOCK_EX);
-            $success = $bytesWritten !== false;
-            
-            if ($this->debugMode) {
-                if ($success) {
-                    error_log("Logged successfully to {$this->logFile}");
-                } else {
-                    error_log("FAILED to log to {$this->logFile}");
-                    error_log("Attempted entry: " . $entry);
-                }
-            }
-        } catch (Throwable $e) {
-            if ($this->debugMode) {
-                error_log("Logger error: " . $e->getMessage());
-                error_log("Log file: " . $this->logFile);
-                error_log("File exists: " . (file_exists($this->logFile) ? 'YES' : 'NO'));
-                error_log("Writable: " . (is_writable($this->logFile) ? 'YES' : 'NO'));
-            }
-        } finally {
-            $this->handlingError = false;
-        }
+        // Custom format (do not include timestamp in message)
+        $formatter = new LineFormatter('%datetime% %channel%.%level_name%: %message%' . PHP_EOL, 'Y-m-d\TH:i:s.uP', true, true);
+        $streamHandler->setFormatter($formatter);
         
-        return $success;
+        // Push the handler to the logger
+        $this->logger->pushHandler($streamHandler);
     }
+
+    public function log(string $module = null, string $level = 'info', string $message = '', array $context = []): bool
+    {
+        // If module name is not provided, use the default one
+        $module = $module ?: $this->defaultModule;
+
+        // Format message: Only include module_name.LEVEL
+        $formattedMessage = "$module.$level: $message";
+
+        // Strip out the module name from the beginning of the message if it matches the default module
+        if (strpos($formattedMessage, "$this->defaultModule.") === 0) {
+            // Remove the default module prefix
+            $formattedMessage = substr($formattedMessage, strlen($this->defaultModule) + 1);
+        }
+
+        // Log the message with the module name and level only
+        $this->logger->log(Logger::toMonologLevel($level), $formattedMessage, $context);
+
+        return true;
+    }
+
     public function exception(Throwable $e): void
     {
-        $this->log('ERROR', $e->getMessage(), [
+        $this->log('app', 'error', 'ERROR: ' . $e->getMessage(), [
             'file' => $e->getFile(),
             'line' => $e->getLine(),
             'trace' => $e->getTraceAsString()
         ]);
     }
 
-    protected function registerErrorHandlers(): void
+    // Handle PHP errors
+    public function handlePhpError(int $level, string $message, string $file, int $line): bool
     {
-        set_error_handler([$this, 'handlePhpError']);
-        set_exception_handler([$this, 'handleUncaughtException']);
-        register_shutdown_function([$this, 'handleFatalError']);
+        $this->log('php_error', 'ERROR', "PHP Error: [$level] $message in $file on line $line");
+        return true; // Prevent default PHP error handler
     }
 
-    public function handlePhpError(int $errno, string $errstr, string $errfile = null, int $errline = null): bool
-    {
-        $this->log('WARNING', "PHP Error [$errno]: $errstr", [
-            'file' => $errfile,
-            'line' => $errline
-        ]);
-        return false; // Let PHP continue with its normal error handler
-    }
-
+    // Handle uncaught exceptions
     public function handleUncaughtException(Throwable $e): void
     {
         $this->exception($e);
-        exit(1); // Exit after logging uncaught exception
     }
 
+    // Handle fatal errors
     public function handleFatalError(): void
     {
         $error = error_get_last();
-        if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
-            $this->log('CRITICAL', "Fatal Error: {$error['message']}", [
-                'file' => $error['file'],
-                'line' => $error['line'],
-                'type' => $error['type']
-            ]);
+        if ($error) {
+            $this->log('fatal_error', 'ERROR', "Fatal error: {$error['message']} in {$error['file']} on line {$error['line']}");
         }
     }
 }
