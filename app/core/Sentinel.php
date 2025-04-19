@@ -1,4 +1,6 @@
 <?php
+// src/Core/Sentinel.php
+
 namespace App\Core;
 
 use Monolog\Logger;
@@ -47,13 +49,6 @@ class JsonArrayHandler extends StreamHandler
 {
     private bool $firstRecord = true;
 
-    /**
-     * @param string        $stream         Path to file
-     * @param int           $level          Monolog level
-     * @param bool          $bubble
-     * @param int|null      $filePermission
-     * @param bool          $useLocking
-     */
     public function __construct(
         string $stream,
         int    $level          = Logger::DEBUG,
@@ -96,85 +91,73 @@ class Sentinel
     protected Logger $logger;
     private bool $debugMode;
     private string $defaultModule;
-    
-        public function __construct(
-            ?string $logFile       = null,
-            bool    $debugMode     = true,
-            string  $defaultModule = 'app'
-        ) {
-            // Load from env or use fallback values
-            $this->debugMode     = filter_var($_ENV['APP_ENV'] ?? '', FILTER_SANITIZE_STRING) === 'debug' || $debugMode;
-            $this->defaultModule = $_ENV['LOG_DEFAULT_MODULE'] ?? $defaultModule;
-    
-            // Resolve log path from env or fallback
-            $logFile = $logFile
-                ?? $_ENV['LOG_PLAIN_FILE']
-                ?? __DIR__ . '/../../storage/logs/app.log';
-    
-            $this->initializeLogFile($logFile);
-            $this->initializeMonolog($logFile);
-    
-            if ($this->debugMode) {
-                $this->log(
-                    'sentinel',
-                    'DEBUG',
-                    'Logger initialized',
-                    [
-                        'logFile'  => $logFile,
-                        'realpath' => realpath($logFile) ?: 'NOT FOUND',
-                        'writable' => is_writable($logFile) ? 'YES' : 'NO',
-                    ]
-                );
-            }
+
+    public function __construct(
+        ?string $logFile       = null,
+        bool    $debugMode     = true,
+        string  $defaultModule = 'app'
+    ) {
+        $this->debugMode     = $debugMode;
+        $this->defaultModule = $defaultModule;
+        $logFile = $logFile ?? __DIR__ . '/../../storage/logs/app.log';
+
+        $this->initializeLogFile($logFile);
+        $this->initializeMonolog($logFile);
+
+        // Register PHP error/exception/shutdown handlers
+        set_error_handler([$this, 'handlePhpError']);
+        set_exception_handler([$this, 'handleUncaughtException']);
+        register_shutdown_function([$this, 'handleFatalError']);
+
+        if ($this->debugMode) {
+            $this->log(
+                'sentinel',
+                'DEBUG',
+                'Logger initialized',
+                [
+                    'logFile'  => $logFile,
+                    'realpath' => realpath($logFile) ?: 'NOT FOUND',
+                    'writable' => is_writable($logFile) ? 'YES' : 'NO',
+                ]
+            );
         }
-    
-        private function initializeLogFile(string $logFile): void
-        {
-            $logDir = dirname($logFile);
-            if (!is_dir($logDir) && !mkdir($logDir, 0775, true) && !is_dir($logDir)) {
-                throw new \RuntimeException("Cannot create log directory: {$logDir}");
-            }
-            if (!file_exists($logFile) && !touch($logFile)) {
-                throw new \RuntimeException("Cannot create log file: {$logFile}");
-            }
-    
-            $permissions = octdec($_ENV['LOG_FILE_PERMISSIONS'] ?? '0664');
-            @chmod($logFile, $permissions);
-    
-            if (!is_writable($logFile)) {
-                throw new \RuntimeException("Log file is not writable: {$logFile}");
-            }
+    }
+
+    private function initializeLogFile(string $logFile): void
+    {
+        $logDir = dirname($logFile);
+        if (!is_dir($logDir) && !mkdir($logDir, 0775, true) && !is_dir($logDir)) {
+            throw new \RuntimeException("Cannot create log directory: {$logDir}");
         }
-    
-        private function initializeMonolog(string $logFile): void
-        {
-            $this->logger = new Logger($this->defaultModule);
-    
-            // Parse log level from env or fallback to DEBUG
-            $level = Logger::toMonologLevel(strtolower($_ENV['LOG_LEVEL'] ?? 'debug'));
-    
-            // Parse date format and line format from env or use default
-            $lineFormat = $_ENV['LOG_TEXT_FORMAT'] ?? "%datetime% %message% %context%\n";
-            $dateFormat = $_ENV['LOG_DATE_FORMAT'] ?? "Y-m-d\\TH:i:s.uP";
-    
-            // 1) Plain-text handler for app.log
-            $textStream = new StreamHandler($logFile, $level);
-            $textStream->setFormatter(new LineFormatter(
-                $lineFormat,
-                $dateFormat,
-                true,
-                true
-            ));
-            $this->logger->pushHandler($textStream);
-    
-            // 2) JSON-array handler for app.json
-            $jsonFile    = $_ENV['LOG_JSON_FILE'] ?? dirname($logFile) . '/app.json';
-            $useLocking  = filter_var($_ENV['LOG_USE_LOCKING'] ?? false, FILTER_VALIDATE_BOOLEAN);
-    
-            $jsonHandler = new JsonArrayHandler($jsonFile, $level, true, null, $useLocking);
-            $jsonHandler->setFormatter(new PrettyJsonFormatter());
-            $this->logger->pushHandler($jsonHandler);
+        if (!file_exists($logFile) && !touch($logFile)) {
+            throw new \RuntimeException("Cannot create log file: {$logFile}");
         }
+        @chmod($logFile, 0664);
+        if (!is_writable($logFile)) {
+            throw new \RuntimeException("Log file is not writable: {$logFile}");
+        }
+    }
+
+    private function initializeMonolog(string $logFile): void
+    {
+        $this->logger = new Logger($this->defaultModule);
+
+        // 1) Plain-text handler for app.log
+        $textStream = new StreamHandler($logFile, Logger::DEBUG);
+        $textStream->setFormatter(new LineFormatter(
+            "%datetime% %message% %context%\n",
+            "Y-m-d\\TH:i:s.uP",
+            true,
+            true
+        ));
+        $this->logger->pushHandler($textStream);
+
+        // 2) JSON-array handler for app.json
+        $jsonFile    = dirname($logFile) . '/app.json';
+        $jsonHandler = new JsonArrayHandler($jsonFile, Logger::DEBUG);
+        $jsonHandler->setFormatter(new PrettyJsonFormatter());
+        $this->logger->pushHandler($jsonHandler);
+    }
 
     public function log(
         ?string $module,
@@ -182,8 +165,8 @@ class Sentinel
         string  $message,
         array   $context = []
     ): bool {
-        $level = strtoupper($level);
-        $mod   = trim((string)$module);
+        $level  = strtoupper($level);
+        $mod    = trim((string)$module);
         $prefix = $mod !== '' ? "{$mod}.{$level}" : $level;
 
         $this->logger->log(
@@ -198,9 +181,9 @@ class Sentinel
     {
         return match ($errNo) {
             E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR => 'ERROR',
-            E_WARNING, E_CORE_WARNING, E_COMPILE_WARNING, E_USER_WARNING         => 'WARNING',
-            E_NOTICE, E_USER_NOTICE, E_STRICT, E_DEPRECATED, E_USER_DEPRECATED   => 'NOTICE',
-            default                                                               => 'INFO',
+            E_WARNING, E_CORE_WARNING, E_COMPILE_WARNING, E_USER_WARNING              => 'WARNING',
+            E_NOTICE, E_USER_NOTICE, E_STRICT, E_DEPRECATED, E_USER_DEPRECATED        => 'NOTICE',
+            default                                                                    => 'INFO',
         };
     }
 
@@ -212,7 +195,9 @@ class Sentinel
     ): bool {
         $lvl = $this->mapErrorLevel($errno);
         $this->log('php_error', $lvl, $errstr, ['file' => $errfile, 'line' => $errline]);
-        return true;
+
+        // return false to allow PHP internal handler too, or true to swallow
+        return false;
     }
 
     public function handleUncaughtException(Throwable $e): void
@@ -228,12 +213,14 @@ class Sentinel
                 'trace' => $e->getTraceAsString(),
             ]
         );
+        http_response_code(500);
+        // optionally render friendly page or JSON here, then exit
     }
 
     public function handleFatalError(): void
     {
         $err = error_get_last();
-        if ($err) {
+        if ($err && in_array($err['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
             $this->log(
                 'fatal_error',
                 'ERROR',
