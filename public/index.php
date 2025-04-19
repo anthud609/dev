@@ -22,13 +22,15 @@ declare(strict_types=1);
  * @package App
  */
 use App\Core\Sentinel;
+use Dotenv\Dotenv;
 
 require __DIR__ . '/../vendor/autoload.php';
 
 //
 // 1) Load environment variables
 //
-(new Dotenv())->bootEnv(__DIR__ . '/../.env');  // populates $_ENV and getenv()
+$dotenv = Dotenv::createImmutable(__DIR__ . '/../');
+$dotenv->load();
 
 
 
@@ -52,14 +54,59 @@ $logger = $container->get(Sentinel::class);
  * 
  * register_shutdown_function: Runs when PHP finishes execution (or a fatal error occurs). You call handleFatalError(), which checks error_get_last() to see if there was a fatal (e.g. parse error, out‑of‑memory) and logs it too.
  */
-set_error_handler([$logger, 'handlePhpError']);
-set_exception_handler([$logger, 'handleUncaughtException']);
-register_shutdown_function([$logger, 'handleFatalError']);
+// 3) Turn ALL PHP errors into ErrorExceptions
+set_error_handler(static function(int $severity, string $message, string $file, int $line): bool {
+    // respect @ operator
+    if (!(error_reporting() & $severity)) {
+        return false;
+    }
+    throw new \ErrorException($message, 0, $severity, $file, $line);
+});
 
-// Add a processor to inject a correlation/request ID into every log record
-$logger->getLogger()->pushProcessor(static function (array $record): array {
-    $record['extra']['request_id'] = bin2hex(random_bytes(8));
-    return $record;
+// 4) Central exception handler
+set_exception_handler(static function(\Throwable $e) use ($logger): void {
+    // 4a) Generate a user‑facing ID
+    $errorId = bin2hex(random_bytes(8));
+
+    // 4b) Log full details to Sentinel
+    $logger->log(
+        'exception',              // module
+        'ERROR',                  // level
+        $e->getMessage(),         // message
+        [
+            'id'    => $errorId,
+            'file'  => $e->getFile(),
+            'line'  => $e->getLine(),
+            'trace' => $e->getTraceAsString(),
+        ]
+    );
+
+    // 4c) Render the friendly error page
+    http_response_code(500);
+    $userMessage = 'An unexpected error occurred. Our engineers have been notified.'; 
+    // variables for the view:
+    include __DIR__ . '/../app/views/error.php';
+
+    exit(1);
+});
+
+// 5) Shutdown handler to catch fatals
+register_shutdown_function(static function() use ($logger): void {
+    $err = error_get_last();
+    if ($err !== null && in_array($err['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        // wrap it in an ErrorException so it reuses our exception handler
+        $ex = new \ErrorException(
+            $err['message'],
+            0,
+            $err['type'],
+            $err['file'],
+            $err['line']
+        );
+        // forward to exception handler
+        (ini_get('display_errors') === '1')
+            ? throw $ex
+            : call_user_func('App\Core\Sentinel::handleUncaughtException', $ex);
+    }
 });
 
 // 4. Your application code / manual logs
